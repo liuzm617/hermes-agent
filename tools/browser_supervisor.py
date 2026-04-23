@@ -551,9 +551,18 @@ class CDPSupervisor:
             self._pending_dialogs[dialog.id] = dialog
 
         if self.dialog_policy == DIALOG_POLICY_AUTO_DISMISS:
-            await self._handle_dialog_cdp(dialog, accept=False, prompt_text="")
+            # Schedule as a task so the read loop can keep consuming frames —
+            # the CDP response to handleJavaScriptDialog arrives on the same
+            # WebSocket, and awaiting it here would deadlock the reader.
+            asyncio.create_task(
+                self._handle_dialog_cdp(dialog, accept=False, prompt_text="")
+            )
         elif self.dialog_policy == DIALOG_POLICY_AUTO_ACCEPT:
-            await self._handle_dialog_cdp(dialog, accept=True, prompt_text=dialog.default_prompt)
+            asyncio.create_task(
+                self._handle_dialog_cdp(
+                    dialog, accept=True, prompt_text=dialog.default_prompt
+                )
+            )
         else:
             # must_respond → arm watchdog so a buggy agent can't stall forever.
             loop = asyncio.get_running_loop()
@@ -676,20 +685,6 @@ class CDPSupervisor:
             return
         self._child_sessions[sid] = {"info": info, "type": target_type}
 
-        # Enable domains on the child so dialogs and frames emitted inside the
-        # OOPIF surface to our top-level WebSocket too.
-        try:
-            await self._cdp("Page.enable", session_id=sid, timeout=3.0)
-            await self._cdp("Runtime.enable", session_id=sid, timeout=3.0)
-            await self._cdp(
-                "Target.setAutoAttach",
-                {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
-                session_id=sid,
-                timeout=3.0,
-            )
-        except Exception as e:
-            logger.debug("child session %s setup failed: %s", sid[:16], e)
-
         # Record the frame with its OOPIF session id for interaction routing.
         if target_type == "iframe":
             target_id = info.get("targetId")
@@ -704,6 +699,25 @@ class CDPSupervisor:
                     cdp_session_id=sid,
                     name=str(info.get("title") or (existing.name if existing else "")),
                 )
+
+        # Enable domains on the child off-loop so the reader keeps pumping.
+        # Awaiting the CDP replies here would deadlock because only the
+        # reader can resolve those replies' Futures.
+        asyncio.create_task(self._enable_child_domains(sid))
+
+    async def _enable_child_domains(self, sid: str) -> None:
+        """Enable Page+Runtime (+nested setAutoAttach) on a child CDP session."""
+        try:
+            await self._cdp("Page.enable", session_id=sid, timeout=3.0)
+            await self._cdp("Runtime.enable", session_id=sid, timeout=3.0)
+            await self._cdp(
+                "Target.setAutoAttach",
+                {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
+                session_id=sid,
+                timeout=3.0,
+            )
+        except Exception as e:
+            logger.debug("child session %s setup failed: %s", sid[:16], e)
 
     def _on_target_detached(self, params: Dict[str, Any]) -> None:
         sid = params.get("sessionId")
