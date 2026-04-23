@@ -27,24 +27,28 @@ Using throwaway probe scripts against a data-URL page that fires alerts in the
 main frame and in a same-origin srcdoc iframe, plus a cross-origin
 `https://example.com` iframe:
 
-| Backend | `Page.javascriptDialogOpening` | `Page.frameAttached` | Cross-origin iframe (OOPIF) | Runtime.evaluate inside OOPIF | Agent can **respond** to dialogs |
-|---|---|---|---|---|---|
-| Local Chrome (`--remote-debugging-port`) / `/browser connect` | ✓ | ✓ | ✓ via `Target.attachedToTarget` | ✓ on child sessionId | ✓ full workflow |
-| Browserbase | ✓ (brief window) | ✓ | ✓ verified with `example.com` | ✓ (`document.title = "Example Domain"`) | ✗ Browserbase auto-dismisses dialogs server-side within ~10ms; agent can observe but not respond |
-| Camofox | ✗ no CDP (REST-only) | partial via DOM snapshot | ✗ | top-level only | ✗ |
+| Backend | Dialog detect | Dialog respond | Frame tree | OOPIF `Runtime.evaluate` |
+|---|---|---|---|---|
+| Local Chrome (`--remote-debugging-port`) / `/browser connect` | ✓ | ✓ full workflow | ✓ | ✓ on child sessionId |
+| Browserbase | ✓ (via bridge) | ✓ full workflow (via bridge) | ✓ | ✓ (`document.title = "Example Domain"`) |
+| Camofox | ✗ no CDP (REST-only) | ✗ | partial via DOM snapshot | ✗ |
 
-**Why Browserbase respond is limited:** Browserbase's CDP proxy uses Playwright
-internally, and Playwright auto-dismisses dialogs by default. The sequence we
-see is `javascriptDialogOpening` followed ~10ms later by
-`javascriptDialogClosed` — the supervisor captures the event but any
-`Page.handleJavaScriptDialog` call from us returns `"No dialog is showing"`.
-Browserbase's recommended pattern is to prevent dialogs via
-`addInitScript` before page load rather than respond to them at runtime.
-[Their docs here](https://docs.browserbase.com/platform/browser/techniques/dialogues).
+**How Browserbase respond works.** Browserbase's CDP proxy uses Playwright
+internally and auto-dismisses native dialogs within ~10ms, so
+`Page.handleJavaScriptDialog` can't keep up. To work around this, the
+supervisor injects a bridge script via
+`Page.addScriptToEvaluateOnNewDocument` that overrides
+`window.alert`/`confirm`/`prompt` with a synchronous XHR to a magic host
+(`hermes-dialog-bridge.invalid`). `Fetch.enable` intercepts those XHRs
+before they touch the network — the dialog becomes a `Fetch.requestPaused`
+event the supervisor captures, and `respond_to_dialog` fulfills via
+`Fetch.fulfillRequest` with a JSON body the injected script decodes.
 
-For full dialog-response support on Browserbase, a separate follow-up can
-add an `addInitScript` path that overrides `window.alert`/`confirm`/`prompt`
-with Python-side handlers — different mechanism, different PR.
+Net result: from the page's perspective, `prompt()` still returns the
+agent-supplied string. From the agent's perspective, it's the same
+`browser_dialog(action=...)` API either way. Tested end-to-end against
+real Browserbase sessions — 4/4 (alert/prompt/confirm-accept/confirm-dismiss)
+pass including value round-tripping back into page JS.
 
 Camofox stays unsupported for this PR; follow-up upstream issue planned at
 `jo-inc/camofox-browser` requesting a dialog polling endpoint.

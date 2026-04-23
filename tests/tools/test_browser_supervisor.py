@@ -14,6 +14,7 @@ Automated: skipped in CI unless ``HERMES_E2E_BROWSER=1`` is set.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -350,3 +351,103 @@ def test_browser_dialog_tool_end_to_end(chrome_cdp, supervisor_registry):
     assert r["success"] is True
     assert r["action"] == "dismiss"
     assert "PYTEST-TOOL-END2END" in r["dialog"]["message"]
+
+
+def test_bridge_captures_prompt_and_returns_reply_text(chrome_cdp, supervisor_registry):
+    """End-to-end: agent's prompt_text round-trips INTO the page's JS.
+
+    Proves the bridge isn't just catching dialogs — it's properly round-
+    tripping our reply back into the page via Fetch.fulfillRequest, so
+    ``prompt()`` actually returns the agent-supplied string to the page.
+    """
+    import base64 as _b64
+
+    cdp_url, _port = chrome_cdp
+    sv = supervisor_registry.get_or_start(task_id="pytest-bridge-prompt", cdp_url=cdp_url)
+
+    # Page fires prompt and stashes the return value on window.
+    html = """<!doctype html><html><body><script>
+      window.__ret = null;
+      setTimeout(() => { window.__ret = prompt('PROMPT-MSG', 'default'); }, 50);
+    </script></body></html>"""
+    url = "data:text/html;base64," + _b64.b64encode(html.encode()).decode()
+
+    import asyncio as _asyncio
+    import websockets as _ws_mod
+
+    async def nav_and_read():
+        async with _ws_mod.connect(cdp_url, max_size=50 * 1024 * 1024) as ws:
+            nid = [1]
+            pending: dict = {}
+
+            async def reader_fn():
+                try:
+                    async for raw in ws:
+                        m = json.loads(raw)
+                        if "id" in m:
+                            fut = pending.pop(m["id"], None)
+                            if fut and not fut.done():
+                                fut.set_result(m)
+                except Exception:
+                    pass
+
+            rd = _asyncio.create_task(reader_fn())
+
+            async def call(method, params=None, sid=None):
+                c = nid[0]; nid[0] += 1
+                p = {"id": c, "method": method}
+                if params: p["params"] = params
+                if sid: p["sessionId"] = sid
+                fut = _asyncio.get_event_loop().create_future()
+                pending[c] = fut
+                await ws.send(json.dumps(p))
+                return await _asyncio.wait_for(fut, timeout=20)
+
+            try:
+                t = (await call("Target.getTargets"))["result"]["targetInfos"]
+                pg = next(x for x in t if x.get("type") == "page")
+                a = await call("Target.attachToTarget", {"targetId": pg["targetId"], "flatten": True})
+                sid = a["result"]["sessionId"]
+
+                # Fire navigate but don't await — prompt() blocks the page
+                nav_id = nid[0]; nid[0] += 1
+                nav_fut = _asyncio.get_event_loop().create_future()
+                pending[nav_id] = nav_fut
+                await ws.send(json.dumps({"id": nav_id, "method": "Page.navigate", "params": {"url": url}, "sessionId": sid}))
+
+                # Wait for supervisor to see the prompt
+                deadline = time.monotonic() + 10
+                dialog = None
+                while time.monotonic() < deadline:
+                    snap = sv.snapshot()
+                    if snap.pending_dialogs:
+                        dialog = snap.pending_dialogs[0]
+                        break
+                    await _asyncio.sleep(0.05)
+                assert dialog is not None, "no dialog captured"
+                assert dialog.bridge_request_id is not None, "expected bridge path"
+                assert dialog.type == "prompt"
+
+                # Agent responds
+                resp = sv.respond_to_dialog("accept", prompt_text="AGENT-SUPPLIED-REPLY")
+                assert resp["ok"] is True
+
+                # Wait for nav to complete + read back
+                try:
+                    await _asyncio.wait_for(nav_fut, timeout=10)
+                except Exception:
+                    pass
+                await _asyncio.sleep(0.5)
+                r = await call(
+                    "Runtime.evaluate",
+                    {"expression": "window.__ret", "returnByValue": True},
+                    sid=sid,
+                )
+                return r.get("result", {}).get("result", {}).get("value")
+            finally:
+                rd.cancel()
+                try: await rd
+                except BaseException: pass
+
+    value = asyncio.run(nav_and_read())
+    assert value == "AGENT-SUPPLIED-REPLY", f"expected AGENT-SUPPLIED-REPLY, got {value!r}"

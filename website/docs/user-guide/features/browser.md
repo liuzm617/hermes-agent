@@ -370,13 +370,13 @@ Responds to a native JS dialog (`alert` / `confirm` / `prompt` / `beforeunload`)
 
 **Availability matrix:**
 
-| Backend | Detection via `pending_dialogs` | Detection via `recent_dialogs` | Response (`browser_dialog` tool) |
-|---|---|---|---|
-| Local Chrome via `/browser connect` or `browser.cdp_url` | ✓ | ✓ | ✓ full workflow |
-| Browserbase | ✗ (auto-dismissed too fast) | ✓ with `closed_by="remote"` | ✗ Browserbase auto-dismisses server-side within ~10ms |
-| Camofox / default local agent-browser | ✗ | ✗ | ✗ (no CDP endpoint) |
+| Backend | Detection via `pending_dialogs` | Response (`browser_dialog` tool) |
+|---|---|---|
+| Local Chrome via `/browser connect` or `browser.cdp_url` | ✓ | ✓ full workflow |
+| Browserbase | ✓ | ✓ full workflow (via injected XHR bridge) |
+| Camofox / default local agent-browser | ✗ | ✗ (no CDP endpoint) |
 
-On Browserbase, follow their [recommended pattern](https://docs.browserbase.com/platform/browser/techniques/dialogues) of preventing dialogs via `addInitScript` overriding `window.alert`/`confirm`/`prompt` before page load — a separate follow-up PR could wire that into the browser tools.
+**How it works on Browserbase.** Browserbase's CDP proxy auto-dismisses real native dialogs server-side within ~10ms, so we can't use `Page.handleJavaScriptDialog`. The supervisor injects a small script via `Page.addScriptToEvaluateOnNewDocument` that overrides `window.alert`/`confirm`/`prompt` with a synchronous XHR. We intercept those XHRs via `Fetch.enable` — the page's JS thread stays blocked on the XHR until we call `Fetch.fulfillRequest` with the agent's response. `prompt()` return values round-trip back into page JS unchanged.
 
 **Dialog policy** is configured in `config.yaml` under `browser.dialog_policy`:
 
